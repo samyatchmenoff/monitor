@@ -1,0 +1,14 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Monitor</title>
+    <link rel="stylesheet" href="static/common.css">
+  </head>
+  <body>
+    <ul>
+      {{ range $res, $metrics := .Metrics }}{{ range $metric := $metrics }}
+      <li><a class="metric" href="graph?resource_id={{ $res }}&metric_key={{ $metric }}"><span class="host">{{ $res }}</span>.{{ $metric }}</a></li>
+      {{ end }}{{ end }}
+    </ul>
+  </body>
+</html>
