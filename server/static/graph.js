@@ -3,6 +3,7 @@ var graph = new Rickshaw.Graph( {
   width: 960,
   height: 500,
   renderer: 'line',
+  interpolation: 'linear',
   series: [
     {
       color: "#c05020",

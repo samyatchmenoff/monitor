@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
@@ -11,26 +12,46 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
 var db *sql.DB
+var triggerReqChan chan MetricsPostRequestBody = make(chan MetricsPostRequestBody)
 
-type MetricsRequestBody struct {
-	ResourceID string             `json:"resource_id"`
-	Timestamp  time.Time          `json:"timestamp"`
-	Metrics    map[string]float64 `json:"metrics"`
+type ResourcesPostRequestBody struct {
+	ResourceID string `json:"resource_id"`
+	Tags       map[string]string
+	Hostname   string
 }
 
-func handlerMetricsPush(w http.ResponseWriter, r *http.Request) {
+func handlerResourcesPost(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
-	var body MetricsRequestBody
+	var body ResourcesPostRequestBody
 	err := decoder.Decode(&body)
 	if err != nil {
 		log.Print(err)
 		http.Error(w, "Could not parse JSON", 400)
 		return
 	}
+}
+
+type MetricsPostRequestBody struct {
+	ResourceID string             `json:"resource_id"`
+	Timestamp  time.Time          `json:"timestamp"`
+	Metrics    map[string]float64 `json:"metrics"`
+}
+
+func handlerMetricsPost(w http.ResponseWriter, r *http.Request) {
+	decoder := json.NewDecoder(r.Body)
+	var body MetricsPostRequestBody
+	err := decoder.Decode(&body)
+	if err != nil {
+		log.Print(err)
+		http.Error(w, "Could not parse JSON", 400)
+		return
+	}
+	triggerReqChan <- body
 	for k, v := range body.Metrics {
 		_, err := db.Exec("INSERT INTO datapoints (resource_id, metric_key, timestamp, value) VALUES ($1, $2, $3, $4)",
 			body.ResourceID, k, body.Timestamp, v)
@@ -89,6 +110,7 @@ type GraphDataPoint struct {
 type GraphTemplateParams struct {
 	ResourceID string
 	MetricKey  string
+	Aggregator string
 	DataPoints []GraphDataPoint
 }
 
@@ -97,10 +119,35 @@ func handlerGraph(w http.ResponseWriter, r *http.Request) {
 
 	params.ResourceID = r.FormValue("resource_id")
 	params.MetricKey = r.FormValue("metric_key")
+	params.Aggregator = r.FormValue("aggregator")
+	if len(params.Aggregator) == 0 {
+		params.Aggregator = "avg"
+	}
+	var aggregatorFunc string
+	switch params.Aggregator {
+	case "avg":
+		aggregatorFunc = "avg"
+	case "sum":
+		aggregatorFunc = "sum"
+	case "max":
+		aggregatorFunc = "max"
+	case "min":
+		aggregatorFunc = "min"
+	default:
+		aggregatorFunc = "avg"
+		params.Aggregator = "avg"
+	}
 
 	change, _ := strconv.ParseBool(r.FormValue("change"))
 
-	rows, err := db.Query("SELECT * FROM (SELECT timestamp, value FROM datapoints WHERE resource_id = $1 AND metric_key = $2 ORDER BY timestamp DESC LIMIT 100) s ORDER BY timestamp ASC", params.ResourceID, params.MetricKey)
+	var rows *sql.Rows
+	var err error
+
+	if len(params.ResourceID) == 0 {
+		rows, err = db.Query(fmt.Sprintf("SELECT timestamp, %s(value) FROM (SELECT date_trunc('minute', timestamp) AS timestamp, value FROM datapoints WHERE metric_key LIKE $1 AND timestamp > now() - INTERVAL '3 hours' ORDER BY timestamp DESC) s GROUP BY timestamp ORDER BY timestamp ASC", aggregatorFunc), strings.Replace(params.MetricKey, "*", "%", -1))
+	} else {
+		rows, err = db.Query(fmt.Sprintf("SELECT timestamp, %s(value) FROM (SELECT date_trunc('minute', timestamp) AS timestamp, value FROM datapoints WHERE resource_id LIKE $1 AND metric_key LIKE $2 AND timestamp > now() - INTERVAL '3 hours' ORDER BY timestamp DESC) s GROUP BY timestamp ORDER BY timestamp ASC", aggregatorFunc), strings.Replace(params.ResourceID, "*", "%", -1), strings.Replace(params.MetricKey, "*", "%", -1))
+	}
 	if err != nil {
 		log.Print(err)
 		http.Error(w, "Internal Server Error", 500)
@@ -149,8 +196,11 @@ func main() {
 		log.Fatal(err)
 	}
 
+	go CheckTriggers(triggerReqChan)
+
 	r := mux.NewRouter()
-	r.HandleFunc("/metrics", handlerMetricsPush).Methods("POST")
+	r.HandleFunc("/resources", handlerResourcesPost).Methods("POST")
+	r.HandleFunc("/metrics", handlerMetricsPost).Methods("POST")
 	r.HandleFunc("/", handlerRoot).Methods("GET")
 	r.HandleFunc("/graph", handlerGraph).Methods("GET")
 	r.PathPrefix("/static").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
